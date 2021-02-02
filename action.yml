@@ -1,0 +1,137 @@
+name: "ChRIS Store Build and Publish"
+description: "Build a multi-architectural container image for your ChRIS plugin and share it to DockerHub and chrisstore.co"
+author: "FNNDSC"
+
+inputs:
+  description:
+    description: "DockerHub repository short description text"
+    required: true
+    default: "A ChRIS plugin"
+  platforms:
+    description: "list of target architectures"
+    required: false
+    default: "linux/amd64,linux/ppc64le,linux/arm64"
+  docker_username:
+    description: "DockerHub username"
+    required: true
+    default: "fnndscbot"
+  docker_password:
+    description: "DockerHub password"
+    required: true
+  chrisstore_token:
+    description: 'ChRIS store credentials in the format "username:password"'
+    required: true
+    default: chris:chris1234
+  chrisstore_url:
+    description: 'URL of ChRIS Store API'
+    required: false
+    default: https://chrisstore.co/api/v1/
+  readme-filepath:
+    description: 'Path to the repository readme'
+    required: false
+    default: ./README.md
+
+outputs:
+  pluginurl:
+    description: "URL of plugin in the ChRIS Store API"
+    value: ${{ steps.chrisstore.outputs.pluginurl }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Get git tag
+      id: git_info
+      if: startsWith(github.ref, 'refs/tags/')
+      run: echo "::set-output name=tag::${GITHUB_REF##*/}"
+    - name: Determine image tag name
+      id: determine
+      env:
+        git_tag: ${{ steps.git_info.outputs.tag }}
+      run: |
+        dock_image="${GITHUB_REPOSITORY,,}"  # to lower case
+        # if build triggered by tag, use tag name
+        tag="${git_tag:-latest}"
+        echo "::set-output name=tag::$dock_image:$tag"
+
+
+    # we want to both push the build to DockerHub, but also
+    # keep a local copy so that we can run
+    #
+    #     docker run fnndsc/pl-app app --json > App.json
+    #
+    # buildx currently does not support multiple output locations,
+    # neither can multi-architectural builds be loaded into docker.
+    # Here we use a local registry to cache the build.
+    # Ideally, helper services should be defined at the job level
+    # of the Github Action workflow however we can't do that in a
+    # composite action definition.
+    - name: Create local registry
+      run: docker run --rm -d --name registry -p 5000:5000 registry:2
+
+    - uses: actions/checkout@v2
+
+    # QEMU is for emulating non-x86_64 platforms
+    - uses: docker/setup-qemu-action@v1
+    # buildx is the next-generation docker image builder
+    - uses: docker/setup-buildx-action@v1
+      with:
+        driver-opts: network=host
+    - name: Cache Docker layers
+      uses: actions/cache@v2
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
+
+    - name: Login to DockerHub
+      id: dockerhub_login
+      uses: docker/login-action@v1
+      with:
+        username: ${{ inputs.docker_username }}
+        password: ${{ inputs.docker_password }}
+    - name: Build and push
+      uses: docker/build-push-action@v2
+      id: docker_build
+      with:
+        context: .
+        file: ./Dockerfile
+        tags: |
+          ${{ steps.determine.outputs.tag }}
+          localhost:5000/${{ steps.determine.outputs.tag }}
+        platforms: ${{ inputs.platforms }}
+        push: true
+        cache-from: type=local,src=/tmp/.buildx-cache
+        cache-to: type=local,dest=/tmp/.buildx-cache
+    - name: Update DockerHub description
+      uses: peter-evans/dockerhub-description@v2
+      with:
+        username: ${{ inputs.docker_username }}
+        password: ${{ inputs.docker_password }}
+        short-description: ${{ inputs.description }}
+        readme-filepath: ${{ inputs.readme-filepath }}
+    - name: Upload to ChRIS Store
+      run: |
+        dock_image=${{ steps.determine.outputs.tag }}
+        docker pull localhost:5000/$dock_image
+        docker tag localhost:5000/$dock_image $dock_image
+        docker rmi localhost:5000/$dock_image
+        script=$(docker inspect --format '{{ (index .Config.Cmd 0)}}' $dock_image)
+        descriptor_file=$(mktemp --suffix .json)
+        docker run --rm $dock_image $script --json > $descriptor_file
+        res=$(
+          curl -s -u "$${{ inputs.chrisstore_token }}" "${{ inputs.chrisstore_url }}plugins/" \
+            -F "name=$(sed 's/^.*\///' <<< $dock_image)" \
+            -F "dock_image=$dock_image"  \
+            -F "descriptor_file=@$descriptor_file" \
+            -F "public_repo=https://github.com/${{ github.repository }}"
+        )
+        href="$(jq -r '.collection.items[0].href' <<< "$res")"
+        echo $href
+        echo "::set-output name=pluginurl::$href"
+    - name: Stop local registry
+      run: docker stop registry
+
+branding:
+  color: "blue"
+  icon: "globe"
