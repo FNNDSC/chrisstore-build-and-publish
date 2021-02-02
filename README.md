@@ -1,3 +1,7 @@
+# :no_entry: Do not use, this was not meant to work :no_entry:
+
+https://github.com/FNNDSC/cookiecutter-chrisapp/issues/25
+
 # ChRIS Store Build and Publish
 
 Automatically builds your ChRIS plugin as a multi-architectural docker image, pushing it to DockerHub.
